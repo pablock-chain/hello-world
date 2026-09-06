@@ -1,0 +1,101 @@
+name: ENS CCN registry extraction
+
+on:
+  pull_request:
+    branches: [master]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  extract:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - name: Fetch and inspect CCN public registry
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p out
+          python - <<'PY'
+          import json
+          import pathlib
+          import re
+          import requests
+          import sys
+          import zipfile
+          from io import BytesIO
+
+          out = pathlib.Path('out')
+          base = 'https://gobernanza.ccn-cert.cni.es'
+          page_url = base + '/certificados'
+          endpoint = base + '/amparo/API/public/certificaciones/empresas/sistemascertificados'
+          js_url = base + '/build/js/certificates.8290753c.js'
+
+          s = requests.Session()
+          s.headers.update({
+              'User-Agent': 'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/126 Safari/537.36',
+              'Accept-Language': 'es-ES,es;q=0.9,en;q=0.8',
+          })
+
+          def fetch(label, url, accept='*/*'):
+              headers = {'Accept': accept, 'Referer': page_url}
+              r = s.get(url, headers=headers, timeout=120, allow_redirects=True)
+              print(f'=== {label} ===')
+              print('URL:', r.url)
+              print('STATUS:', r.status_code)
+              print('HEADERS:', json.dumps(dict(r.headers), ensure_ascii=False, indent=2))
+              print('COOKIES:', s.cookies.get_dict())
+              print('SIZE:', len(r.content))
+              print('MAGIC:', repr(r.content[:120]))
+              (out / f'{label}.headers.json').write_text(json.dumps(dict(r.headers), ensure_ascii=False, indent=2), encoding='utf-8')
+              (out / f'{label}.bin').write_bytes(r.content)
+              try:
+                  (out / f'{label}.txt').write_text(r.text, encoding='utf-8')
+              except Exception as exc:
+                  print('TEXT_SAVE_ERROR:', repr(exc))
+              return r
+
+          page = fetch('certificados_page', page_url, 'text/html,application/xhtml+xml')
+          js = fetch('certificates_js', js_url, 'text/javascript,application/javascript,*/*;q=0.8')
+
+          js_text = js.text
+          api_strings = sorted(set(re.findall(r'[\"\']([^\"\']*(?:/API/|certific)[^\"\']*)[\"\']', js_text, flags=re.I)))
+          print('=== RELEVANT JS STRINGS ===')
+          for item in api_strings[:500]:
+              print(item)
+          (out / 'relevant_js_strings.txt').write_text('\n'.join(api_strings), encoding='utf-8')
+
+          reg = fetch('registry_export', endpoint, 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet,text/csv,text/html,application/json,*/*;q=0.5')
+          c = reg.content
+          kind = 'unknown'
+          if c.startswith(b'PK\x03\x04'):
+              kind = 'zip_or_xlsx'
+              try:
+                  z = zipfile.ZipFile(BytesIO(c))
+                  print('ZIP MEMBERS:', z.namelist()[:100])
+              except Exception as exc:
+                  print('ZIP_ERROR:', repr(exc))
+          elif c.startswith(b'%PDF'):
+              kind = 'pdf'
+          elif c.lstrip().startswith((b'{', b'[')):
+              kind = 'json'
+          elif b'<html' in c[:5000].lower() or b'<table' in c[:5000].lower():
+              kind = 'html'
+          elif b',' in c[:5000] or b';' in c[:5000] or b'\t' in c[:5000]:
+              kind = 'delimited_text'
+          print('DETECTED_KIND:', kind)
+          (out / 'detected_kind.txt').write_text(kind, encoding='utf-8')
+
+          if reg.status_code >= 400:
+              sys.exit(f'Registry fetch failed: HTTP {reg.status_code}')
+          PY
+      - name: Upload raw extraction
+        uses: actions/upload-artifact@v4
+        with:
+          name: ens-ccn-raw
+          path: out/
+          if-no-files-found: error
+          retention-days: 1
