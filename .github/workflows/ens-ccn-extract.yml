@@ -1,6 +1,8 @@
 name: ENS CCN registry extraction
 
 on:
+  push:
+    branches: [tmp/ens-ccn-extract-20260906]
   pull_request:
     branches: [master]
   workflow_dispatch:
